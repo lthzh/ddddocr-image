@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     pydantic \
+    pillow \
     ddddocr
 
 COPY main.py .
