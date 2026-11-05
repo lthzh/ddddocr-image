@@ -1,16 +1,19 @@
 import base64
+import io
 import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from PIL import Image
 import ddddocr
 
 app = FastAPI()
 
-# 初始化模型单例
+# 初始化字符识别模型单例（保留原有 /predict 兼容性）
 ocr = ddddocr.DdddOcr(show_ad=False)
-
-# 强制限制字符集只输出 0-9
 ocr.set_ranges("0123456789")
+
+# 初始化专用于滑块缺口匹配的模型单例（关闭文字与目标检测以极大提升匹配效率）
+slide_engine = ddddocr.DdddOcr(det=False, ocr=False, show_ad=False)
 
 class CaptchaRequest(BaseModel):
     image_base64: str
@@ -64,6 +67,17 @@ def predict(req: CaptchaRequest):
 # 保留原有 /health 与 /predict 接口完全不变
 # ==========================================
 
+def normalize_image_bytes(img_bytes: bytes) -> bytes:
+    """确保图片字节流被规范化为标准 PNG 格式（自动兼容 WebP、JPEG 等特殊格式）"""
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+        out = io.BytesIO()
+        im.save(out, format="PNG")
+        return out.getvalue()
+    except Exception:
+        return img_bytes
+
+
 class SlideMatchRequest(BaseModel):
     target_base64: str = ""       # 拼图切片小图 Base64 (支持带 data:image/... 前缀)
     background_base64: str = ""   # 带缺口背景图 Base64 (支持带 data:image/... 前缀)
@@ -98,9 +112,11 @@ def slide_match(req: SlideMatchRequest):
             detail={"error": "INVALID_BASE64"}
         )
 
-    # 2. 执行滑块缺口匹配
+    # 2. 图像格式兼容性规范化（转换 WebP 为 PNG）并执行滑块缺口匹配
     try:
-        res = ocr.slide_match(target_bytes, bg_bytes, simple_target=req.simple_target)
+        target_clean = normalize_image_bytes(target_bytes)
+        bg_clean = normalize_image_bytes(bg_bytes)
+        res = slide_engine.slide_match(target_clean, bg_clean, simple_target=req.simple_target)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -113,15 +129,28 @@ def slide_match(req: SlideMatchRequest):
             detail={"error": "GAP_NOT_FOUND"}
         )
 
-    target_box = res["target"]  # [x1, y1, x2, y2]
+    # 关键修复：ddddocr 底层返回值为 NumPy 标量 (np.int32/np.int64)
+    # FastAPI 在进行 JSON 响应序列化时无法识别 np.int64，会引发 "TypeError: Object of type int64 is not JSON serializable"
+    # 该错误发生在路由执行完毕后的 Starlette 中间件层，导致向客户端返回 500 Internal Server Error
+    # 因此必须显式将所有数值转换回 Python 原生 int
+    raw_target = res["target"]
+    target_box = [int(v) for v in raw_target]
+    target_x = int(res.get("target_x", target_box[0]))
+    target_y = int(res.get("target_y", target_box[1] if len(target_box) > 1 else 0))
+
+    x1 = target_box[0]
+    y1 = target_box[1] if len(target_box) > 1 else target_y
+    x2 = target_box[2] if len(target_box) > 2 else x1
+    y2 = target_box[3] if len(target_box) > 3 else y1
+
     return {
         "target": target_box,
-        "target_x": target_box[0],
-        "target_y": res.get("target_y", target_box[1]),
+        "target_x": target_x,
+        "target_y": target_y,
         "box": {
-            "x1": target_box[0],
-            "y1": target_box[1],
-            "x2": target_box[2],
-            "y2": target_box[3]
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2
         }
     }
