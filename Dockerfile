@@ -8,13 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装依赖
+# 安装依赖 (保留 ddddocr，同时引入轻量级中文点选高精度识别库 rapidocr-onnxruntime)
 RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     pydantic \
     pillow \
-    ddddocr
+    ddddocr \
+    rapidocr-onnxruntime
 
 COPY main.py .
 
