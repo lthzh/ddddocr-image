@@ -46,7 +46,7 @@ jobs:
             type=ref,event=tag
             type=sha,prefix=
 
-      - name: 构建并推送到 GHCR (多平台: amd64 与 arm64)
+      - name: "构建并推送到 GHCR (多平台: amd64 与 arm64)"
         uses: docker/build-push-action@v6
         with:
           context: .
