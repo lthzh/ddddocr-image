@@ -23,6 +23,9 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      - name: 设置 QEMU (支持多架构跨平台构建如 arm64)
+        uses: docker/setup-qemu-action@v3
+
       - name: 设置 Docker Buildx (支持多平台与高级缓存)
         uses: docker/setup-buildx-action@v3
 
@@ -43,10 +46,11 @@ jobs:
             type=ref,event=tag
             type=sha,prefix=
 
-      - name: 构建并推送到 GHCR
+      - name: 构建并推送到 GHCR (多平台: amd64 与 arm64)
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
