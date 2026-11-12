@@ -113,7 +113,7 @@ def predict(req: CaptchaRequest):
 # 保留原有 /health 与 /predict 接口完全不变
 # ==========================================
 
-def normalize_image_bytes(img_bytes: bytes, target_format: str = "PNG") -> bytes:
+def normalize_image_bytes(img_bytes: bytes, target_format: str = "PNG", upscale_small: bool = False) -> bytes:
     """确保图片字节流被规范化并处理透明通道（将 RGBA 透明背景转换为纯白底，防止黑字淹没）"""
     try:
         im = Image.open(io.BytesIO(img_bytes))
@@ -125,6 +125,9 @@ def normalize_image_bytes(img_bytes: bytes, target_format: str = "PNG") -> bytes
             im = bg.convert("RGB")
         elif im.mode != "RGB":
             im = im.convert("RGB")
+        # 对小尺寸提示条 (如 132x44) 放大 2 倍以大幅提高小字检出率
+        if upscale_small and (im.height < 60 or im.width < 180):
+            im = im.resize((im.width * 2, im.height * 2), Image.Resampling.LANCZOS)
         out = io.BytesIO()
         im.save(out, format=target_format)
         return out.getvalue()
@@ -274,9 +277,9 @@ def click_match(req: ClickMatchRequest):
         # 2. 优先策略：使用 RapidOCR 进行端到端高精度中文点选匹配
         if rapid_engine is not None:
             try:
-                # 2.1 若未直接提取出有效汉字，则识别提示文字图片中的汉字序列 (已自动转白底)
+                # 2.1 若未直接提取出有效汉字，则识别提示文字图片中的汉字序列 (2倍放大白底，大幅提升检测率)
                 if not target_chars and prompt_bytes:
-                    prompt_clean = normalize_image_bytes(prompt_bytes)
+                    prompt_clean = normalize_image_bytes(prompt_bytes, upscale_small=True)
                     prompt_res, _ = rapid_engine(prompt_clean)
                     if prompt_res:
                         for item in prompt_res:
@@ -288,10 +291,9 @@ def click_match(req: ClickMatchRequest):
                 bg_res, _ = rapid_engine(bg_clean)
 
                 if target_chars and bg_res:
-                    # 2.3 按提示文字的先后顺序，在背景大图识别结果中定位中心坐标
                     matched_boxes = set()
+                    # 2.3.1 第一轮：文本精确包含匹配
                     for target in target_chars:
-                        found = False
                         for idx, (bbox, text, score) in enumerate(bg_res):
                             if idx in matched_boxes:
                                 continue
@@ -306,20 +308,40 @@ def click_match(req: ClickMatchRequest):
                                     "y": cy
                                 })
                                 matched_boxes.add(idx)
-                                found = True
                                 break
+
+                    # 2.3.2 第二轮补全：如果匹配到的坐标数量少于目标汉字数 (部分变形/旋转字未精确匹配)，从背景大图剩余候选框中按置信度补齐
+                    target_count = len(target_chars) if target_chars else 3
+                    if len(coordinates) < target_count:
+                        remaining_boxes = [
+                            (idx, bbox, score) for idx, (bbox, text, score) in enumerate(bg_res)
+                            if idx not in matched_boxes
+                        ]
+                        remaining_boxes.sort(key=lambda x: x[2], reverse=True)
+                        needed = target_count - len(coordinates)
+                        for idx, bbox, score in remaining_boxes[:needed]:
+                            pts_x = [float(pt[0]) for pt in bbox]
+                            pts_y = [float(pt[1]) for pt in bbox]
+                            cx = int(round(sum(pts_x) / len(pts_x)))
+                            cy = int(round(sum(pts_y) / len(pts_y)))
+                            coordinates.append({
+                                "char": "",
+                                "x": cx,
+                                "y": cy
+                            })
+                            matched_boxes.add(idx)
             except Exception:
                 coordinates = []
 
-        # 3. 降级备用策略：若未安装 RapidOCR 或未能匹配出全部坐标，调用 ddddocr 目标检测引擎定位候选框
-        if not coordinates:
+        # 3. 降级备用策略：若未安装 RapidOCR 或坐标仍不足 3 个，调用 ddddocr 目标检测引擎定位候选框补齐
+        target_count = len(target_chars) if target_chars else 3
+        if len(coordinates) < target_count:
             try:
                 bg_clean = normalize_image_bytes(img_bytes)
                 bboxes = get_det_engine().detection(bg_clean)
                 if bboxes:
-                    # 截取合理的点击数量（优先匹配 target_chars 数量，否则默认最多 3 个），防止过度点击触发超时
-                    max_count = len(target_chars) if target_chars else 3
-                    for box in bboxes[:max_count]:
+                    needed = target_count - len(coordinates)
+                    for box in bboxes[:needed]:
                         x1, y1, x2, y2 = [int(v) for v in box]
                         cx = int((x1 + x2) / 2)
                         cy = int((y1 + y2) / 2)
@@ -329,10 +351,11 @@ def click_match(req: ClickMatchRequest):
                             "y": cy
                         })
             except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail={"error": "CLICK_DETECTION_FAILED", "message": str(e)}
-                )
+                if not coordinates:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={"error": "CLICK_DETECTION_FAILED", "message": str(e)}
+                    )
 
         if not coordinates:
             raise HTTPException(
